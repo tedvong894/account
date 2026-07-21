@@ -1,0 +1,9 @@
+# 依赖 / 临时文件
+node_modules/
+.DS_Store
+*.log
+.tmp/
+.workbuddy/
+
+# 本地私密配置（不要把真实密钥提交到仓库）
+js/config.local.js

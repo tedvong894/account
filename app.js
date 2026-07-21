@@ -9,6 +9,8 @@
     month: null,
     ledgers: [],
     categories: [],
+    assets: [],
+    txs: [],            // 当前月的交易缓存，避免每次点按都查库
     unsubs: []
   };
 
@@ -37,6 +39,7 @@
   }
 
   // ---------- 数据加载 ----------
+  // 仅在启动 / 切换 Supabase 时全量重载（含账本 / 分类 / 资产）
   async function reloadCaches() {
     state.ledgers = await Store.getLedgers();
     state.categories = await Store.getCategories();
@@ -44,6 +47,18 @@
     if (!state.ledgerId && state.ledgers[0]) state.ledgerId = state.ledgers[0].id;
     const savedMonth = localStorage.getItem('yy_current_month');
     if (!state.month) state.month = savedMonth || monthKeyOf(new Date());
+  }
+  // 只重载当前月交易（热路径只调它一次，各视图读 state.txs）
+  async function loadTxs() {
+    if (!state.ledgerId) { state.txs = []; return; }
+    state.txs = await Store.getTransactions({ ledgerId: state.ledgerId, month: state.month });
+  }
+  // 只重载资产（实时订阅 / 转账后轻量刷新，不触发分类、账本查询）
+  async function loadAssets() {
+    state.assets = await Store.getAssets();
+  }
+  async function loadCategories() {
+    state.categories = await Store.getCategories();
   }
 
   // ---------- 弹窗基础 ----------
@@ -63,7 +78,7 @@
   async function renderHeader() {
     $('#header-month').textContent = state.month;
 
-    const txs = await Store.getTransactions({ ledgerId: state.ledgerId, month: state.month });
+    const txs = state.txs;
     let exp = 0, inc = 0;
     txs.forEach(t => { if (t.type === 'expense') exp += Number(t.amount); else inc += Number(t.amount); });
     $('#header-expense').textContent = fmt(exp);
@@ -75,7 +90,7 @@
   async function renderRecord() {
     const view = $('#view-record');
     const expCats = state.categories.filter(c => c.type === 'expense');
-    const txs = await Store.getTransactions({ ledgerId: state.ledgerId, month: state.month });
+    const txs = state.txs;
     const cm = catMap();
     const recent = txs.slice(0, 5);
 
@@ -124,7 +139,7 @@
   async function renderDetail() {
     const view = $('#view-detail');
     const cm = catMap();
-    let txs = await Store.getTransactions({ ledgerId: state.ledgerId, month: state.month });
+    let txs = state.txs;
 
     // 按日期分组
     const groups = {};
@@ -212,7 +227,7 @@
   async function renderStats() {
     const view = $('#view-stats');
     const cm = catMap();
-    const txs = await Store.getTransactions({ ledgerId: state.ledgerId, month: state.month });
+    const txs = state.txs;
     let exp = 0, inc = 0;
     const byCat = {};
     txs.forEach(t => {
@@ -395,16 +410,18 @@
       const note = $('#f-note').value.trim();
       const assetId = selAsset;
       await Store.saveTransaction({ ledger_id: state.ledgerId, category_id: selCat, asset_id: assetId, type, amount, note, occurred_at });
-      // 同步调整对应资产余额：支出减、收入加
+      // 同步调整对应资产余额：支出减、收入加（更新内存，不触发全量重载）
         if (assetId) {
           const a = assets.find(x => x.id === assetId);
           if (a) {
           const delta = type === 'income' ? Number(amount) : -Number(amount);
-          await Store.saveAsset({ ...a, balance: Number(a.balance) + delta });
+          const saved = await Store.saveAsset({ ...a, balance: Number(a.balance) + delta });
+          const i = state.assets.findIndex(x => x.id === assetId);
+          if (i >= 0) state.assets[i] = saved || { ...a, balance: Number(a.balance) + delta };
         }
       }
       closeModal();
-      await reloadCaches();
+      await loadTxs();
       refreshAll();
       toast('已保存');
     });
@@ -459,14 +476,14 @@
       const c = cats.find(x => x.id === b.dataset.del);
       if (!confirm(`删除分类「${c ? c.name : ''}」？\n已有的相关记录会显示为「未分类」，不会丢失金额。建议优先用「编辑」修改。`)) return;
       await Store.deleteCategory(b.dataset.del);
-      await reloadCaches(); renderRecord(); openCategoryModal();
+      await loadCategories(); openCategoryModal();
     }));
     $('#add-cat').addEventListener('click', async () => {
       const name = $('#nc-name').value.trim();
       if (!name) { toast('请输入名称'); return; }
       const type = $('#nc-type').value;
       await Store.saveCategory({ name, type, icon: ncSel, color: type === 'expense' ? '#FF6B5E' : '#2BBF7A', builtin: false });
-      await reloadCaches(); openCategoryModal();
+      await loadCategories(); openCategoryModal();
     });
   }
 
@@ -498,7 +515,7 @@
       const name = $('#ec-name').value.trim();
       if (!name) { toast('请输入名称'); return; }
       await Store.saveCategory({ ...c, name, icon: ecSel });
-      await reloadCaches();
+      await loadCategories();
       refreshAll();
       openCategoryModal();
       toast('已保存');
@@ -549,13 +566,13 @@
       if (!url || !key) { toast('请填写完整'); return; }
       const btn = $('#save-cfg'); btn.textContent = '连接中…'; btn.disabled = true;
       const mode = await Store.applyConfig(url, key);
-      await reloadCaches(); refreshAll();
+      await reloadCaches(); await loadTxs(); refreshAll();
       closeModal();
       toast(mode === 'supabase' ? '已连接 Supabase ✓' : '连接失败，已回退本地');
     });
     $('#clear-cfg').addEventListener('click', async () => {
       await Store.applyConfig('', '');
-      await reloadCaches(); refreshAll(); closeModal(); toast('已切换为本地存储');
+      await reloadCaches(); await loadTxs(); refreshAll(); closeModal(); toast('已切换为本地存储');
     });
   }
 
@@ -575,28 +592,31 @@
   // ---------- 资产页 ----------
   async function renderAssets() {
     const view = $('#view-assets');
-    const assets = await Store.getAssets();
+    const assets = state.assets || [];
     const total = assets.reduce((s, a) => s + Number(a.balance), 0);
     view.innerHTML = `
-      <div class="card" style="background:linear-gradient(135deg,var(--primary),#6E5BEF);color:#fff">
+      <div class="card" style="background:linear-gradient(135deg,#0A84FF,#007AFF);color:#fff">
         <div style="font-size:13px;opacity:.85">总资产</div>
-        <div style="font-size:30px;font-weight:800;margin-top:4px">${fmt(total)}</div>
+        <div style="font-size:32px;font-weight:800;margin-top:4px;font-variant-numeric:tabular-nums">${fmt(total)}</div>
       </div>
       <div class="card" style="padding:6px 16px">
         ${assets.map(a => `
           <div class="list-row" data-key="${a.id}" style="cursor:pointer">
             <span class="lr-icon" style="background:${a.color}22">${a.icon}</span>
             <span class="lr-main"><div class="lr-title">${esc(a.name)}</div></span>
-            <span style="font-weight:700">${fmt(a.balance)}</span>
+            <span style="font-weight:700;font-variant-numeric:tabular-nums">${fmt(a.balance)}</span>
           </div>`).join('')}
       </div>
-      <div style="font-size:12px;color:var(--text-sub);text-align:center;padding:2px 14px 6px">点击任意资产可修改余额</div>`;
+      <button class="btn-ghost" id="transfer-btn" style="margin-top:4px">⇄ 转账（账户互转）</button>
+      <div style="font-size:12px;color:var(--text-sub);text-align:center;padding:8px 14px 2px">点击任意资产可修改余额</div>`;
     $$('#view-assets .list-row').forEach(el => {
       el.addEventListener('click', () => openAssetEditModal(assets.find(a => a.id === el.dataset.key)));
     });
+    const tb = $('#transfer-btn'); if (tb) tb.addEventListener('click', () => openTransferModal());
   }
 
   function openAssetEditModal(a) {
+    if (!a) return;
     openModal(`
       <div class="modal-header"><div class="modal-title">${esc(a.name)} 余额</div><button class="modal-close" id="m-close">×</button></div>
       <div class="amount-input"><span class="cur">¥</span><input id="a-amt" type="text" inputmode="decimal" value="${a.balance}" /></div>
@@ -606,8 +626,62 @@
     $('#save-asset').addEventListener('click', async () => {
       const v = parseFloat($('#a-amt').value);
       if (isNaN(v)) { toast('请输入金额'); return; }
-      await Store.saveAsset({ id: a.id, akey: a.akey, name: a.name, icon: a.icon, color: a.color, balance: v });
+      const saved = await Store.saveAsset({ id: a.id, akey: a.akey, name: a.name, icon: a.icon, color: a.color, balance: v });
+      const i = state.assets.findIndex(x => x.id === a.id);
+      if (i >= 0) state.assets[i] = saved || { ...a, balance: v };
       closeModal(); refreshAll(); toast('已保存');
+    });
+  }
+
+  // ---------- 账户互转 ----------
+  function openTransferModal() {
+    const assets = state.assets || [];
+    if (assets.length < 2) { toast('至少需要两个账户'); return; }
+    let from = assets[0].id;
+    let to = assets[1].id;
+    function grid(side) {
+      return assets.map(a => `<button type="button" class="acct-btn${a.id === (side === 'from' ? from : to) ? ' active' : ''}" data-a="${a.id}" data-side="${side}" style="flex:1;min-width:0;padding:11px 6px;border:1px solid ${a.id === (side === 'from' ? from : to) ? a.color : 'var(--line)'};border-radius:13px;background:${a.id === (side === 'from' ? from : to) ? a.color + '1A' : '#fff'};color:${a.id === (side === 'from' ? from : to) ? a.color : 'var(--text)'};font-weight:700;cursor:pointer;font-size:13px">${a.icon} ${esc(a.name)}</button>`).join('');
+    }
+    openModal(`
+      <div class="modal-header"><div class="modal-title">账户转账</div><button class="modal-close" id="m-close">×</button></div>
+      <div class="field" style="display:block"><span class="f-label" style="display:block;margin-bottom:8px">从（扣款）</span>
+        <div id="tf-from" style="display:flex;gap:8px;flex-wrap:wrap">${grid('from')}</div></div>
+      <div class="field" style="display:block"><span class="f-label" style="display:block;margin-bottom:8px">到（入账）</span>
+        <div id="tf-to" style="display:flex;gap:8px;flex-wrap:wrap">${grid('to')}</div></div>
+      <div class="amount-input"><span class="cur">¥</span><input id="tf-amt" type="text" inputmode="decimal" placeholder="0.00" /></div>
+      <button class="btn-primary" id="save-tf">确认转账</button>
+    `);
+    $('#m-close').addEventListener('click', closeModal);
+    function bindSide(side) {
+      $$(`#tf-${side} .acct-btn`).forEach(b => b.addEventListener('click', () => {
+        if (side === 'from') from = b.dataset.a; else to = b.dataset.a;
+        $$(`#tf-${side} .acct-btn`).forEach(x => {
+          const on = x === b;
+          const ca = assets.find(z => z.id === x.dataset.a);
+          x.style.borderColor = on ? (ca ? ca.color : 'var(--primary)') : 'var(--line)';
+          x.style.background = on ? ((ca ? ca.color : 'var(--primary)') + '1A') : '#fff';
+          x.style.color = on ? (ca ? ca.color : 'var(--primary)') : 'var(--text)';
+          x.classList.toggle('active', on);
+        });
+        if (from === to) toast('转出与转入不能是同一账户');
+      }));
+    }
+    bindSide('from'); bindSide('to');
+    $('#save-tf').addEventListener('click', async () => {
+      const amt = parseFloat($('#tf-amt').value);
+      if (!amt || amt <= 0) { toast('请输入金额'); return; }
+      if (from === to) { toast('转出与转入不能是同一账户'); return; }
+      const a = assets.find(x => x.id === from);
+      const b = assets.find(x => x.id === to);
+      if (!a || !b) return;
+      if (Number(a.balance) < amt) { toast('转出账户余额不足'); return; }
+      const na = await Store.saveAsset({ ...a, balance: Number(a.balance) - amt });
+      const nb = await Store.saveAsset({ ...b, balance: Number(b.balance) + amt });
+      const ia = state.assets.findIndex(x => x.id === from);
+      const ib = state.assets.findIndex(x => x.id === to);
+      if (ia >= 0) state.assets[ia] = na || { ...a, balance: Number(a.balance) - amt };
+      if (ib >= 0) state.assets[ib] = nb || { ...b, balance: Number(b.balance) + amt };
+      closeModal(); refreshAll(); toast('转账成功');
     });
   }
 
@@ -631,14 +705,14 @@
     await renderCurrent();
   }
 
-  // ---------- 实时订阅 ----------
+  // ---------- 实时订阅（轻量：只刷新变化的那张表）----------
   function setupRealtime() {
     state.unsubs.forEach(u => u && u());
     state.unsubs = [];
-    const onTx = () => { refreshAll(); toast('数据已更新（实时）'); };
+    const onTx = () => { loadTxs().then(() => { refreshAll(); toast('数据已更新（实时）'); }); };
     state.unsubs.push(Store.subscribe('transactions', onTx));
-    state.unsubs.push(Store.subscribe('assets', () => { reloadCaches().then(refreshAll); }));
-    state.unsubs.push(Store.subscribe('categories', () => { reloadCaches().then(refreshAll); }));
+    state.unsubs.push(Store.subscribe('assets', () => { loadAssets().then(refreshAll); }));
+    state.unsubs.push(Store.subscribe('categories', () => { loadCategories().then(refreshAll); }));
   }
 
   // ---------- 事件绑定 ----------
@@ -654,7 +728,7 @@
     const d = new Date(y, m - 1 + delta, 1);
     state.month = monthKeyOf(d);
     localStorage.setItem('yy_current_month', state.month);
-    refreshAll();
+    loadTxs().then(refreshAll);
   }
 
   // ---------- 启动 ----------
@@ -662,6 +736,7 @@
     bindGlobal();
     await Store.init();
     await reloadCaches();
+    await loadTxs();
     await renderHeader();
     await renderCurrent();
     if (Store.isLive()) setupRealtime();

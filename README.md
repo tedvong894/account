@@ -87,12 +87,12 @@ python3 -m http.server 8080
 
 ```
 index.html          页面骨架
-css/style.css       样式
-js/config.js        默认 Supabase 配置（可留空，改用 App 内设置页填写）
-js/store.js         数据层：本地 / Supabase 双后端 + 实时订阅
-js/seed.js          默认账本与分类种子数据
-js/app.js           页面渲染与交互
-sql/schema.sql      Supabase 表结构 / 权限 / 实时发布
+style.css           样式
+config.js          默认 Supabase 配置（可留空，改用 App 内设置页填写）
+store.js           数据层：本地 / Supabase 双后端 + 实时订阅
+seed.js            默认账本与分类种子数据
+app.js             页面渲染与交互
+schema.sql         Supabase 表结构 / 权限 / 实时发布
 ```
 
 ---
